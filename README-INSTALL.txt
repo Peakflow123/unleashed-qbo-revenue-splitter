@@ -1,0 +1,1 @@
+Copy the included app folder into your project root: C:\Users\Dell\Downloads\Unleashed-QBO\ and replace existing files. Then run: git add . && git commit -m "Fix QuickBooks callback diagnostics" && git push
