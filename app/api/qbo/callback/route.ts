@@ -1,10 +1,9 @@
 import { NextResponse } from 'next/server';
-import { supabaseAdmin } from '@/lib/supabaseAdmin';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-function env(name: string) {
+function readEnv(name: string) {
   return (process.env[name] || '').trim();
 }
 
@@ -14,24 +13,44 @@ function mask(value: string) {
   return `${value.slice(0, 6)}...${value.slice(-4)}`;
 }
 
+async function saveToSupabase(realmId: string, tokenData: any) {
+  const { supabaseAdmin } = await import('@/lib/supabaseAdmin');
+  const supabase = supabaseAdmin();
+
+  const { error } = await supabase.from('app_config').upsert(
+    {
+      company_id: 'default',
+      qbo_realm_id: realmId,
+      qbo_access_token: tokenData.access_token,
+      qbo_refresh_token: tokenData.refresh_token,
+      updated_at: new Date().toISOString()
+    },
+    { onConflict: 'company_id' }
+  );
+
+  if (error) {
+    throw new Error(error.message);
+  }
+}
+
 export async function GET(req: Request) {
   const currentUrl = new URL(req.url);
 
+  const code = currentUrl.searchParams.get('code');
+  const realmId = currentUrl.searchParams.get('realmId');
+
+  const clientId = readEnv('QBO_CLIENT_ID');
+  const clientSecret = readEnv('QBO_CLIENT_SECRET');
+  const appBaseUrl = readEnv('APP_BASE_URL');
+  const redirectUri = `${appBaseUrl}/api/qbo/callback`;
+
   try {
-    const code = currentUrl.searchParams.get('code');
-    const realmId = currentUrl.searchParams.get('realmId');
-
-    const clientId = env('QBO_CLIENT_ID');
-    const clientSecret = env('QBO_CLIENT_SECRET');
-    const appBaseUrl = env('APP_BASE_URL');
-    const redirectUri = `${appBaseUrl}/api/qbo/callback`;
-
     if (!code || !realmId) {
       return NextResponse.json(
         {
-          success: false,
-          step: 'callback_validation',
-          error: 'Missing QuickBooks code or realmId',
+          ok: false,
+          version: 'qbo-debug-pack-v2',
+          step: 'missing_callback_params',
           codeExists: Boolean(code),
           realmIdExists: Boolean(realmId)
         },
@@ -42,9 +61,9 @@ export async function GET(req: Request) {
     if (!clientId || !clientSecret || !appBaseUrl) {
       return NextResponse.json(
         {
-          success: false,
-          step: 'environment_variables',
-          error: 'Missing required environment variables',
+          ok: false,
+          version: 'qbo-debug-pack-v2',
+          step: 'missing_environment_variables',
           QBO_CLIENT_ID: mask(clientId),
           QBO_CLIENT_SECRET: mask(clientSecret),
           APP_BASE_URL: appBaseUrl || 'MISSING',
@@ -84,9 +103,9 @@ export async function GET(req: Request) {
     if (!tokenResponse.ok) {
       return NextResponse.json(
         {
-          success: false,
-          step: 'qbo_token_exchange',
-          error: 'QuickBooks token exchange failed',
+          ok: false,
+          version: 'qbo-debug-pack-v2',
+          step: 'qbo_token_exchange_failed',
           qboStatus: tokenResponse.status,
           qboResponse: tokenData,
           debug: {
@@ -101,26 +120,15 @@ export async function GET(req: Request) {
       );
     }
 
-    const supabase = supabaseAdmin();
-
-    const { error: dbError } = await supabase.from('app_config').upsert(
-      {
-        company_id: 'default',
-        qbo_realm_id: realmId,
-        qbo_access_token: tokenData.access_token,
-        qbo_refresh_token: tokenData.refresh_token,
-        updated_at: new Date().toISOString()
-      },
-      { onConflict: 'company_id' }
-    );
-
-    if (dbError) {
+    try {
+      await saveToSupabase(realmId, tokenData);
+    } catch (dbError: any) {
       return NextResponse.json(
         {
-          success: false,
-          step: 'supabase_save',
-          error: 'QuickBooks connected, but Supabase save failed',
-          supabaseError: dbError.message,
+          ok: false,
+          version: 'qbo-debug-pack-v2',
+          step: 'supabase_save_failed',
+          error: dbError?.message || 'Unknown Supabase error',
           realmId
         },
         { status: 500 }
@@ -131,10 +139,17 @@ export async function GET(req: Request) {
   } catch (error: any) {
     return NextResponse.json(
       {
-        success: false,
-        step: 'unexpected_crash',
-        error: error?.message || 'Unknown callback error',
-        callbackUrl: currentUrl.toString()
+        ok: false,
+        version: 'qbo-debug-pack-v2',
+        step: 'unexpected_crash_inside_callback',
+        error: error?.message || 'Unknown error',
+        callbackUrl: currentUrl.toString(),
+        debug: {
+          QBO_CLIENT_ID: mask(clientId),
+          QBO_CLIENT_SECRET: mask(clientSecret),
+          APP_BASE_URL: appBaseUrl || 'MISSING',
+          redirectUri
+        }
       },
       { status: 500 }
     );
