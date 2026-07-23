@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { runInvoiceSync } from '@/lib/sync';
+import { supabaseAdmin } from '@/lib/supabaseAdmin';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -11,18 +11,7 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
-  let body: any = {};
-  try {
-    body = await req.json();
-  } catch {
-    body = {};
-  }
-
-  const result = await runInvoiceSync({
-    maxInvoices: Number(body.maxInvoices || 5),
-    sinceDays: Number(body.sinceDays || 14),
-    forceUpdate: Boolean(body.forceUpdate)
-  });
-
-  return NextResponse.json(result);
+  const { error } = await supabaseAdmin().from('sync_log').delete().eq('status', 'failed');
+  if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+  return NextResponse.json({ ok: true });
 }

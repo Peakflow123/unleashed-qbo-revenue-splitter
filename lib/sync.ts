@@ -6,6 +6,15 @@ const COMPANY_ID = 'default';
 
 type UnleashedConfig = { apiId: string; apiKey: string; clientType: string };
 type SyncOptions = { maxInvoices?: number; sinceDays?: number; forceUpdate?: boolean };
+type Mapping = { unleashed_group_name: string; qbo_account_id: string; qbo_account_name: string; qbo_tax_code_id?: string | null };
+
+type SyncContext = {
+  config: UnleashedConfig;
+  mappings: Mapping[];
+  productGroupCache: Map<string, string>;
+  qboItemCache: Map<string, string>;
+  qboCustomerCache: Map<string, { value: string; name: string }>;
+};
 
 function pickInvoiceGuid(inv: any) {
   return inv.Guid || inv.InvoiceGuid || inv.GuidIdentifier || inv.guid;
@@ -23,14 +32,14 @@ function pickLines(inv: any) {
   return inv.InvoiceLines || inv.Lines || inv.SalesInvoiceLines || inv.SalesInvoiceLine || [];
 }
 
-function pickAmount(line: any) {
-  return Number(
-    line.LineTotal ||
-      line.Total ||
-      line.SubTotal ||
-      line.TotalPrice ||
-      Number(line.UnitPrice || line.Price || 0) * Number(line.Quantity || 0)
-  );
+function toNumber(value: any, fallback = 0) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function round(value: number, decimals = 2) {
+  const factor = Math.pow(10, decimals);
+  return Math.round((value + Number.EPSILON) * factor) / factor;
 }
 
 function escapeSqlName(name: string) {
@@ -44,24 +53,11 @@ function dateDaysAgo(days: number) {
 }
 
 function getProductGuidFromLine(line: any) {
-  return (
-    line.Product?.Guid ||
-    line.Product?.ProductGuid ||
-    line.ProductGuid ||
-    line.Product?.GuidIdentifier ||
-    line.Product?.guid ||
-    null
-  );
+  return line.Product?.Guid || line.Product?.ProductGuid || line.ProductGuid || line.Product?.GuidIdentifier || line.Product?.guid || null;
 }
 
 function getProductCodeFromLine(line: any) {
-  return (
-    line.Product?.ProductCode ||
-    line.Product?.Code ||
-    line.ProductCode ||
-    line.Product?.ProductId ||
-    null
-  );
+  return line.Product?.ProductCode || line.Product?.Code || line.ProductCode || line.Product?.ProductId || null;
 }
 
 function getGroupNameFromObject(obj: any) {
@@ -77,28 +73,43 @@ function getGroupNameFromObject(obj: any) {
   );
 }
 
-async function getProductGroupForLine(config: UnleashedConfig, line: any, productCache: Map<string, string>) {
-  const fromLine =
-    getGroupNameFromObject(line) ||
-    getGroupNameFromObject(line.Product) ||
-    line.Product?.ProductGroup ||
-    line.ProductGroup;
+function getLineAmount(line: any) {
+  return toNumber(
+    line.LineTotal ?? line.Total ?? line.SubTotal ?? line.TotalPrice ?? line.LineAmount ?? line.Amount,
+    toNumber(line.UnitPrice ?? line.Price, 0) * toNumber(line.Quantity, 1)
+  );
+}
 
+function getQboLineValues(line: any) {
+  const qty = toNumber(line.Quantity, 1) || 1;
+  const sourceAmount = getLineAmount(line);
+
+  // QuickBooks requires Amount to exactly equal UnitPrice * Qty.
+  // So use the Unleashed line total as the source, then derive UnitPrice from that amount.
+  const amount = round(sourceAmount, 2);
+  const unitPrice = round(amount / qty, 6);
+  const qboAmount = round(unitPrice * qty, 2);
+
+  return { qty, unitPrice, amount: qboAmount };
+}
+
+async function getProductGroupForLine(ctx: SyncContext, line: any) {
+  const fromLine = getGroupNameFromObject(line) || getGroupNameFromObject(line.Product) || line.Product?.ProductGroup || line.ProductGroup;
   if (typeof fromLine === 'string' && fromLine.trim()) return fromLine.trim();
 
   const productGuid = getProductGuidFromLine(line);
   if (productGuid) {
-    if (productCache.has(productGuid)) return productCache.get(productGuid) || 'Unmapped';
+    if (ctx.productGroupCache.has(productGuid)) return ctx.productGroupCache.get(productGuid) || 'Unmapped';
 
     try {
-      const product = await unleashedGet(config, `Products/${productGuid}`);
+      const product = await unleashedGet(ctx.config, `Products/${productGuid}`);
       const groupName = getGroupNameFromObject(product) || getGroupNameFromObject(product?.Product);
       if (groupName) {
-        productCache.set(productGuid, String(groupName).trim());
+        ctx.productGroupCache.set(productGuid, String(groupName).trim());
         return String(groupName).trim();
       }
     } catch {
-      // Continue to Product Code fallback.
+      // Continue to product code fallback.
     }
   }
 
@@ -107,20 +118,18 @@ async function getProductGroupForLine(config: UnleashedConfig, line: any, produc
   return 'Unmapped';
 }
 
-async function findMapping(groupName: string) {
-  const sb = supabaseAdmin();
-
-  const exact = await sb
-    .from('group_account_mappings')
-    .select('*')
-    .eq('unleashed_group_name', groupName)
-    .maybeSingle();
-
-  if (exact.data?.qbo_account_id) return exact.data;
-
-  const { data: allMappings } = await sb.from('group_account_mappings').select('*');
+function findMapping(ctx: SyncContext, groupName: string) {
   const normalized = groupName.trim().toLowerCase();
-  return (allMappings || []).find((m: any) => String(m.unleashed_group_name || '').trim().toLowerCase() === normalized) || null;
+  const exact = ctx.mappings.find((m) => String(m.unleashed_group_name || '').trim().toLowerCase() === normalized);
+  if (exact?.qbo_account_id) return exact;
+
+  // Optional fallback: if user creates a mapping with group name "Unmapped", use it for all unmapped products.
+  if (normalized.startsWith('unmapped')) {
+    const fallback = ctx.mappings.find((m) => String(m.unleashed_group_name || '').trim().toLowerCase() === 'unmapped');
+    if (fallback?.qbo_account_id) return fallback;
+  }
+
+  return null;
 }
 
 async function findExistingQboInvoiceByDocNumber(docNumber: string) {
@@ -130,27 +139,30 @@ async function findExistingQboInvoiceByDocNumber(docNumber: string) {
 
 export async function runInvoiceSync(options: SyncOptions = {}) {
   const sb = supabaseAdmin();
-
-  const maxInvoices = options.maxInvoices || 10;
-  const sinceDays = options.sinceDays || 30;
+  const maxInvoices = Math.min(Math.max(Number(options.maxInvoices || 5), 1), 25);
+  const sinceDays = Math.min(Math.max(Number(options.sinceDays || 14), 1), 365);
   const forceUpdate = Boolean(options.forceUpdate);
 
-  const { data: cfg, error } = await sb
-    .from('app_config')
-    .select('*')
-    .eq('company_id', COMPANY_ID)
-    .single();
-
+  const { data: cfg, error } = await sb.from('app_config').select('*').eq('company_id', COMPANY_ID).single();
   if (error || !cfg) throw new Error('Missing app configuration');
   if (!cfg.unleashed_api_id || !cfg.unleashed_api_key) throw new Error('Missing Unleashed credentials');
 
-  const unleashedConfig = {
-    apiId: cfg.unleashed_api_id,
-    apiKey: cfg.unleashed_api_key,
-    clientType: cfg.unleashed_client_type || 'Nexvista/revenue-splitter'
+  const { data: mappingRows } = await sb.from('group_account_mappings').select('*');
+  const mappings = (mappingRows || []).filter((m: any) => m.qbo_account_id) as Mapping[];
+
+  const ctx: SyncContext = {
+    config: {
+      apiId: cfg.unleashed_api_id,
+      apiKey: cfg.unleashed_api_key,
+      clientType: cfg.unleashed_client_type || 'Nexvista/revenue-splitter'
+    },
+    mappings,
+    productGroupCache: new Map<string, string>(),
+    qboItemCache: new Map<string, string>(),
+    qboCustomerCache: new Map<string, { value: string; name: string }>()
   };
 
-  const invoices = await getInvoices(unleashedConfig, dateDaysAgo(sinceDays));
+  const invoices = await getInvoices(ctx.config, dateDaysAgo(sinceDays));
   let processed = 0;
   let skipped = 0;
   let failed = 0;
@@ -178,7 +190,7 @@ export async function runInvoiceSync(options: SyncOptions = {}) {
     }
 
     try {
-      const invoice = await getInvoice(unleashedConfig, guid);
+      const invoice = await getInvoice(ctx.config, guid);
       const docNumber = pickInvoiceNumber(invoice);
       const existingQbo = await findExistingQboInvoiceByDocNumber(docNumber);
 
@@ -199,7 +211,7 @@ export async function runInvoiceSync(options: SyncOptions = {}) {
         continue;
       }
 
-      const result = await createQboInvoiceFromUnleashed(unleashedConfig, invoice, existingQbo && forceUpdate ? existingQbo : null);
+      const result = await createQboInvoiceFromUnleashed(ctx, invoice, existingQbo && forceUpdate ? existingQbo : null);
 
       await sb.from('sync_log').upsert(
         {
@@ -234,20 +246,33 @@ export async function runInvoiceSync(options: SyncOptions = {}) {
   return { checked, processed, skipped, failed, maxInvoices, sinceDays, forceUpdate, details };
 }
 
-async function getOrCreateCustomer(name: string) {
+async function getOrCreateCustomer(ctx: SyncContext, name: string) {
+  if (ctx.qboCustomerCache.has(name)) return ctx.qboCustomerCache.get(name)!;
+
   const found = await qboQuery(COMPANY_ID, `select * from Customer where DisplayName = '${escapeSqlName(name)}'`);
   const existing = found?.QueryResponse?.Customer?.[0];
-  if (existing) return { value: existing.Id, name: existing.DisplayName };
+  if (existing) {
+    const ref = { value: existing.Id, name: existing.DisplayName };
+    ctx.qboCustomerCache.set(name, ref);
+    return ref;
+  }
 
   const created = await qboRequest(COMPANY_ID, 'POST', 'customer', { DisplayName: name });
-  return { value: created.Customer.Id, name: created.Customer.DisplayName };
+  const ref = { value: created.Customer.Id, name: created.Customer.DisplayName };
+  ctx.qboCustomerCache.set(name, ref);
+  return ref;
 }
 
-async function getOrCreateItemForAccount(accountId: string, accountName: string) {
+async function getOrCreateItemForAccount(ctx: SyncContext, accountId: string, accountName: string) {
+  if (ctx.qboItemCache.has(accountId)) return ctx.qboItemCache.get(accountId)!;
+
   const itemName = `Revenue Split - ${accountName}`.slice(0, 95);
   const found = await qboQuery(COMPANY_ID, `select * from Item where Name = '${escapeSqlName(itemName)}'`);
   const existing = found?.QueryResponse?.Item?.[0];
-  if (existing) return existing.Id;
+  if (existing) {
+    ctx.qboItemCache.set(accountId, existing.Id);
+    return existing.Id;
+  }
 
   const created = await qboRequest(COMPANY_ID, 'POST', 'item', {
     Name: itemName,
@@ -255,41 +280,36 @@ async function getOrCreateItemForAccount(accountId: string, accountName: string)
     IncomeAccountRef: { value: accountId, name: accountName }
   });
 
+  ctx.qboItemCache.set(accountId, created.Item.Id);
   return created.Item.Id;
 }
 
-async function createQboInvoiceFromUnleashed(config: UnleashedConfig, invoice: any, existingQboInvoice: any = null) {
-  const productCache = new Map<string, string>();
+async function createQboInvoiceFromUnleashed(ctx: SyncContext, invoice: any, existingQboInvoice: any = null) {
   const customerName = pickCustomerName(invoice);
-  const customerRef = await getOrCreateCustomer(customerName);
+  const customerRef = await getOrCreateCustomer(ctx, customerName);
   const lines = pickLines(invoice);
   const qboLines = [];
 
   for (const line of lines) {
-    const groupName = await getProductGroupForLine(config, line, productCache);
-    const map = await findMapping(groupName);
+    const groupName = await getProductGroupForLine(ctx, line);
+    const map = findMapping(ctx, groupName);
 
     if (!map?.qbo_account_id) {
       throw new Error(`No QBO account mapping for product group: ${groupName}. Product: ${getProductCodeFromLine(line) || 'unknown'}`);
     }
 
-    const itemId = await getOrCreateItemForAccount(map.qbo_account_id, map.qbo_account_name);
-    const amount = pickAmount(line);
+    const itemId = await getOrCreateItemForAccount(ctx, map.qbo_account_id, map.qbo_account_name);
+    const values = getQboLineValues(line);
 
     qboLines.push({
       DetailType: 'SalesItemLineDetail',
-      Amount: amount,
-      Description:
-        line.Product?.ProductDescription ||
-        line.Product?.Description ||
-        line.Product?.ProductCode ||
-        line.Description ||
-        groupName,
+      Amount: values.amount,
+      Description: line.Product?.ProductDescription || line.Product?.Description || line.Product?.ProductCode || line.Description || groupName,
       SalesItemLineDetail: {
         ItemRef: { value: itemId },
-        Qty: Number(line.Quantity || 1),
-        UnitPrice: Number(line.UnitPrice || line.Price || amount),
-        TaxCodeRef: map.qbo_tax_code_id ? { value: map.qbo_tax_code_id } : undefined
+        Qty: values.qty,
+        UnitPrice: values.unitPrice,
+        ...(map.qbo_tax_code_id ? { TaxCodeRef: { value: map.qbo_tax_code_id } } : {})
       }
     });
   }
@@ -305,11 +325,7 @@ async function createQboInvoiceFromUnleashed(config: UnleashedConfig, invoice: a
   };
 
   if (existingQboInvoice) {
-    const updated = await qboRequest(COMPANY_ID, 'POST', 'invoice', {
-      ...basePayload,
-      Id: existingQboInvoice.Id,
-      SyncToken: existingQboInvoice.SyncToken
-    });
+    const updated = await qboRequest(COMPANY_ID, 'POST', 'invoice', { ...basePayload, Id: existingQboInvoice.Id, SyncToken: existingQboInvoice.SyncToken });
     return { qboInvoiceId: updated.Invoice.Id, action: 'updated' };
   }
 
